@@ -23,7 +23,7 @@ const CORS_HEADERS = {
 /**
  * --- ES Module Entry Point ---
  * 1. 'fetch': Handles the user's request
- * 2. 'scheduled': Handles the cron job
+ * 2. 'queue': Handles retrying failed batches
  */
 export default {
   /**
@@ -40,7 +40,7 @@ export default {
     }
 
     try {
-      // Pass 'env' and 'ctx' so our handler can use KV and Caching
+      // Pass 'env' and 'ctx' so our handler can use the Queue and Cache
       return await handleGetRequest(request, env, ctx);
     } catch (error) {
       console.error(`Critical Error: ${error.message}`);
@@ -51,79 +51,57 @@ export default {
   },
 
   /**
-   * --- 2. THE SCHEDULED HANDLER (for the "cron job") ---
-   * This runs automatically based on your wrangler.toml
+   * --- 2. THE QUEUE HANDLER (for retrying) ---
+   * This runs automatically when a message is sent to the queue.
    */
-  async scheduled(event, env, ctx) {
-    console.log("Cron job running: Retrying failed batches...");
-
-    // Get the "to-do list" of failed batches from KV
-    // We only retry 50 batches per hour to avoid rate limits
-    const { keys } = await env.RETRY_QUEUE.list({ limit: 50 }); 
-
-    for (const key of keys) {
-      const targetUrl = key.name; // The key is the full URL that failed
-      console.log(`Retrying: ${targetUrl}`);
-
-      // Re-build the parameters from the URL
-      const url = new URL(targetUrl);
-      const params = url.searchParams;
-      const regNo = params.get('reg_no');
-      const queryParams = {
-        year: params.get('year'),
-        semester: params.get('semester'),
-        exam_held: params.get('exam_held')
-      };
-
-      let baseUrl;
-      if (targetUrl.startsWith(REGULAR_BACKEND_URL)) {
-          baseUrl = REGULAR_BACKEND_URL;
-      } else {
-          baseUrl = LE_BACKEND_URL;
-      }
-
+  async queue(batch, env, ctx) {
+    for (const message of batch.messages) {
+      // 'message.body' contains the { targetUrl, regNo, queryParams, baseUrl } we sent
+      const { targetUrl, regNo, queryParams, baseUrl } = message.body;
+      console.log(`Queue retrying: ${targetUrl}`);
+      
       // 1. Re-fetch the failed batch from Vercel
       const freshBatch = await fetchVercelBatch(baseUrl, regNo, queryParams);
-
-      // 2. Check the new result (is it still a temporary error?)
+      
+      // 2. Check the new result
       const isBadBatch = freshBatch.some(r => r.status.includes('Error'));
 
       if (!isBadBatch) {
         // --- SUCCESS! ---
-        console.log(`Retry SUCCESS for ${targetUrl}. Caching and de-queuing.`);
-
+        console.log(`Retry SUCCESS for ${targetUrl}. Caching.`);
+        
         const responseToCache = new Response(JSON.stringify(freshBatch), {
           headers: {
             'Content-Type': 'application/json',
             'Cache-Control': `public, max-age=${CACHE_TTL}`
           }
         });
-
+        
         // 3a. Put the good data in the main cache
         const cacheKey = new Request(targetUrl);
         ctx.waitUntil(caches.default.put(cacheKey, responseToCache.clone()));
-
-        // 3b. Remove it from the "to-do list"
-        ctx.waitUntil(env.RETRY_QUEUE.delete(key.name));
+        
+        // 3b. Mark the queue message as successful
+        message.ack();
 
       } else {
         // --- FAILED AGAIN ---
-        console.log(`Retry FAILED for ${targetUrl}. Will try again next hour.`);
-        // Just leave it in the KV queue.
+        console.log(`Retry FAILED for ${targetUrl}. Will retry automatically.`);
+        // We tell the queue to retry this message later
+        message.retry();
       }
     }
-    console.log("Cron job finished.");
   }
 };
 
 /**
  * --- Main Request Handler Logic ---
- * Handles the incoming request from the user
  */
 async function handleGetRequest(request, env, ctx) {
   const url = new URL(request.url);
   const params = url.searchParams;
 
+  // 1. Get & Validate Parameters
   const regNo = params.get('reg_no');
   const year = params.get('year');
   const semester = params.get('semester');
@@ -135,28 +113,29 @@ async function handleGetRequest(request, env, ctx) {
   if (!year || !semester || !examHeld) {
     return new Response(JSON.stringify({ error: 'Missing parameters' }), { status: 400, headers: CORS_HEADERS });
   }
-
+  
   const queryParams = { year, semester, exam_held: examHeld };
 
+  // 2. Parse Registration Number
   const firstTwo = regNo.slice(0, 2);
   const restReg = regNo.slice(2, -3);
   const suffixNum = parseInt(regNo.slice(-3));
 
-  let regularPrefix, lePrefix, probeUrl, isRegularStudent;
+  let regularPrefix, lePrefix, probeBaseUrl, isRegularStudent;
   let userBatchStartRegNo;
 
   if (suffixNum >= 900) {
     isRegularStudent = false;
     lePrefix = regNo.slice(0, -3);
     regularPrefix = (parseInt(firstTwo) - 1).toString() + restReg;
-    probeUrl = LE_BACKEND_URL;
+    probeBaseUrl = LE_BACKEND_URL;
     const userBatchStartNum = Math.floor((suffixNum - 901) / BATCH_STEP) * BATCH_STEP + 901;
     userBatchStartRegNo = lePrefix + String(userBatchStartNum).padStart(3, '0');
   } else {
     isRegularStudent = true;
     regularPrefix = regNo.slice(0, -3);
     lePrefix = (parseInt(firstTwo) + 1).toString() + restReg;
-    probeUrl = REGULAR_BACKEND_URL;
+    probeBaseUrl = REGULAR_BACKEND_URL;
     const userBatchStartNum = Math.floor((suffixNum - 1) / BATCH_STEP) * BATCH_STEP + 1;
     userBatchStartRegNo = regularPrefix + String(userBatchStartNum).padStart(3, '0');
   }
@@ -164,9 +143,9 @@ async function handleGetRequest(request, env, ctx) {
   // 3. --- PROBE USER'S BATCH (CHECKS CACHE FIRST) ---
   console.log(`Probing user's batch first: ${userBatchStartRegNo}`);
   const probeBatchResults = await getCachedOrFetchBatch(
-    probeUrl, userBatchStartRegNo, queryParams, env, ctx
+    probeBaseUrl, userBatchStartRegNo, queryParams, env, ctx
   );
-
+  
   // 4. Smart Range Logic
   let regRange = SMALL_REG_RANGE;
   let leRange = SMALL_LE_RANGE;
@@ -182,7 +161,7 @@ async function handleGetRequest(request, env, ctx) {
   }
 
   // 5. Create Fetch Swarm
-  const fetchTasks = []; // A list of functions to call
+  const fetchTasks = [];
   const [regStart, regEnd] = regRange;
   const [leStart, leEnd] = leRange;
 
@@ -203,7 +182,7 @@ async function handleGetRequest(request, env, ctx) {
 
   // 7. Process Final Results
   let combinedData = [...probeBatchResults]; // Start with the user's batch
-
+  
   allOtherResults.forEach(result => {
     if (result.status === 'fulfilled' && Array.isArray(result.value)) {
       combinedData.push(...result.value);
@@ -212,7 +191,7 @@ async function handleGetRequest(request, env, ctx) {
         combinedData.push({ regNo: 'Unknown', status: 'Error', reason: `Worker Error: ${result.reason}` });
     }
   });
-
+  
   // Sort by regNo to fix the order
   const finalSortedData = combinedData.sort((a, b) => a.regNo.localeCompare(b.regNo));
 
@@ -228,8 +207,7 @@ async function handleGetRequest(request, env, ctx) {
 async function getCachedOrFetchBatch(baseUrl, regNo, queryParams, env, ctx) {
   const { year, semester, exam_held } = queryParams;
   const targetUrl = `${baseUrl}?reg_no=${regNo}&year=${year}&semester=${semester}&exam_held=${encodeURIComponent(exam_held)}`;
-
-  // The Cache Key is a Request object
+  
   const cacheKey = new Request(targetUrl);
 
   // 1. Check the main cache first
@@ -244,30 +222,36 @@ async function getCachedOrFetchBatch(baseUrl, regNo, queryParams, env, ctx) {
   const freshBatch = await fetchVercelBatch(baseUrl, regNo, queryParams);
 
   // 3. Analyze the new batch
-  // A "bad batch" is one that contains a *temporary* error
   const isBadBatch = freshBatch.some(r => 
       r.status.includes('Error') || r.status.includes('Timed Out')
   );
-
+  
   if (isBadBatch) {
     // --- FAILED BATCH ---
     console.log(`Fetch for ${regNo} FAILED. Queuing for retry.`);
-    // Add this URL to the "to-do list" (KV)
-    ctx.waitUntil(env.RETRY_QUEUE.put(targetUrl, "failed"));
+    
+    // Send a message to the queue to retry this batch
+    // This happens in the background
+    ctx.waitUntil(env.RETRY_QUEUE.send({
+        targetUrl: targetUrl,
+        regNo: regNo,
+        queryParams: queryParams,
+        baseUrl: baseUrl
+    }));
+    
     return freshBatch; 
-
+    
   } else {
     // --- GOOD BATCH (all 'success' or 'Record not found') ---
     console.log(`Fetch for ${regNo} SUCCEEDED. Caching.`);
-
+    
     const responseToCache = new Response(JSON.stringify(freshBatch), {
       headers: {
         'Content-Type': 'application/json',
         'Cache-Control': `public, max-age=${CACHE_TTL}` // Cache for 4 days
       }
     });
-
-    // Put it in the cache in the background
+    
     ctx.waitUntil(caches.default.put(cacheKey, responseToCache.clone()));
     return freshBatch;
   }
@@ -275,7 +259,6 @@ async function getCachedOrFetchBatch(baseUrl, regNo, queryParams, env, ctx) {
 
 /**
 * --- Helper Function: Pooled Concurrency ---
-* Runs promises in small, controlled batches (size = CONCURRENCY_LIMIT)
 */
 async function fetchInBatches(promiseFunctions, batchSize) {
   let allResults = [];
@@ -290,7 +273,6 @@ async function fetchInBatches(promiseFunctions, batchSize) {
 
 /**
 * --- Helper Function: Fetch Vercel Batch ---
-* This function is designed to *never* reject, only fulfill with an array.
 */
 async function fetchVercelBatch(baseUrl, regNo, queryParams) {
   const { year, semester, exam_held } = queryParams;
@@ -313,4 +295,4 @@ async function fetchVercelBatch(baseUrl, regNo, queryParams) {
     let reason = error.name === 'AbortError' ? 'Request Timed Out (30s)' : error.message;
     return [{ regNo: regNo, status: 'Error', reason: `Fetch Failed: ${reason}` }];
   }
-      }
+}

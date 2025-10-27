@@ -6,7 +6,7 @@ const LE_BACKEND_URL = 'https://multi-result-beu-le.vercel.app/api/le/result';
 const CACHE_TTL = 4 * 24 * 60 * 60;
 
 // --- Configuration: Fetch Ranges ---
-const CONCURRENCY_LIMIT = 1; // Kept at 1 for 100% accuracy
+const CONCURRENCY_LIMIT = 1; // Keep at 1 for 100% accuracy
 const BATCH_STEP = 5;
 const SMALL_REG_RANGE = [1, 60];
 const SMALL_LE_RANGE = [901, 930];
@@ -23,7 +23,7 @@ const CORS_HEADERS = {
 /**
  * --- ES Module Entry Point ---
  * 1. 'fetch': Handles the user's request
- * 2. 'queue': Handles retrying failed batches
+ * 2. 'scheduled': Handles the cron job (every 5 minutes)
  */
 export default {
   /**
@@ -40,7 +40,7 @@ export default {
     }
 
     try {
-      // Pass 'env' and 'ctx' so our handler can use the Queue and Cache
+      // Pass 'env' and 'ctx' so our handler can use KV and Caching
       return await handleGetRequest(request, env, ctx);
     } catch (error) {
       console.error(`Critical Error: ${error.message}`);
@@ -51,24 +51,46 @@ export default {
   },
 
   /**
-   * --- 2. THE QUEUE HANDLER (for retrying) ---
-   * This runs automatically when a message is sent to the queue.
+   * --- 2. THE SCHEDULED HANDLER (for the "cron job") ---
+   * This runs automatically every 5 minutes (from wrangler.toml)
    */
-  async queue(batch, env, ctx) {
-    for (const message of batch.messages) {
-      // 'message.body' contains the { targetUrl, regNo, queryParams, baseUrl } we sent
-      const { targetUrl, regNo, queryParams, baseUrl } = message.body;
-      console.log(`Queue retrying: ${targetUrl}`);
+  async scheduled(event, env, ctx) {
+    console.log("Cron job running: Retrying failed batches...");
+    
+    // Get the "to-do list" of failed batches from KV
+    // We retry 20 batches every 5 minutes
+    const { keys } = await env.RETRY_QUEUE.list({ limit: 20 }); 
+
+    for (const key of keys) {
+      const targetUrl = key.name; // The key is the full URL that failed
+      console.log(`Retrying: ${targetUrl}`);
+
+      // Re-build the parameters from the URL
+      const url = new URL(targetUrl);
+      const params = url.searchParams;
+      const regNo = params.get('reg_no');
+      const queryParams = {
+        year: params.get('year'),
+        semester: params.get('semester'),
+        exam_held: params.get('exam_held')
+      };
+      
+      let baseUrl;
+      if (targetUrl.startsWith(REGULAR_BACKEND_URL)) {
+          baseUrl = REGULAR_BACKEND_URL;
+      } else {
+          baseUrl = LE_BACKEND_URL;
+      }
       
       // 1. Re-fetch the failed batch from Vercel
       const freshBatch = await fetchVercelBatch(baseUrl, regNo, queryParams);
       
-      // 2. Check the new result
+      // 2. Check the new result (is it still a temporary error?)
       const isBadBatch = freshBatch.some(r => r.status.includes('Error'));
 
       if (!isBadBatch) {
         // --- SUCCESS! ---
-        console.log(`Retry SUCCESS for ${targetUrl}. Caching.`);
+        console.log(`Retry SUCCESS for ${targetUrl}. Caching and de-queuing.`);
         
         const responseToCache = new Response(JSON.stringify(freshBatch), {
           headers: {
@@ -81,27 +103,27 @@ export default {
         const cacheKey = new Request(targetUrl);
         ctx.waitUntil(caches.default.put(cacheKey, responseToCache.clone()));
         
-        // 3b. Mark the queue message as successful
-        message.ack();
-
+        // 3b. Remove it from the "to-do list" (KV)
+        ctx.waitUntil(env.RETRY_QUEUE.delete(key.name));
+        
       } else {
         // --- FAILED AGAIN ---
-        console.log(`Retry FAILED for ${targetUrl}. Will retry automatically.`);
-        // We tell the queue to retry this message later
-        message.retry();
+        console.log(`Retry FAILED for ${targetUrl}. Will try again in 5 minutes.`);
+        // Just leave it in the KV queue.
       }
     }
+    console.log("Cron job finished.");
   }
 };
 
 /**
  * --- Main Request Handler Logic ---
+ * Handles the incoming request from the user
  */
 async function handleGetRequest(request, env, ctx) {
   const url = new URL(request.url);
   const params = url.searchParams;
 
-  // 1. Get & Validate Parameters
   const regNo = params.get('reg_no');
   const year = params.get('year');
   const semester = params.get('semester');
@@ -116,7 +138,6 @@ async function handleGetRequest(request, env, ctx) {
   
   const queryParams = { year, semester, exam_held: examHeld };
 
-  // 2. Parse Registration Number
   const firstTwo = regNo.slice(0, 2);
   const restReg = regNo.slice(2, -3);
   const suffixNum = parseInt(regNo.slice(-3));
@@ -161,7 +182,7 @@ async function handleGetRequest(request, env, ctx) {
   }
 
   // 5. Create Fetch Swarm
-  const fetchTasks = [];
+  const fetchTasks = []; // A list of functions to call
   const [regStart, regEnd] = regRange;
   const [leStart, leEnd] = leRange;
 
@@ -230,14 +251,9 @@ async function getCachedOrFetchBatch(baseUrl, regNo, queryParams, env, ctx) {
     // --- FAILED BATCH ---
     console.log(`Fetch for ${regNo} FAILED. Queuing for retry.`);
     
-    // Send a message to the queue to retry this batch
-    // This happens in the background
-    ctx.waitUntil(env.RETRY_QUEUE.send({
-        targetUrl: targetUrl,
-        regNo: regNo,
-        queryParams: queryParams,
-        baseUrl: baseUrl
-    }));
+    // Add this URL to the "to-do list" (KV)
+    // env.RETRY_QUEUE comes from the wrangler.toml binding
+    ctx.waitUntil(env.RETRY_QUEUE.put(targetUrl, "failed"));
     
     return freshBatch; 
     
@@ -295,4 +311,4 @@ async function fetchVercelBatch(baseUrl, regNo, queryParams) {
     let reason = error.name === 'AbortError' ? 'Request Timed Out (30s)' : error.message;
     return [{ regNo: regNo, status: 'Error', reason: `Fetch Failed: ${reason}` }];
   }
-}
+      }

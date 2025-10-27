@@ -3,13 +3,12 @@ name = "resulta"
 main = "src/index.js" # This points to your main code file
 compatibility_date = "2024-05-01"
 
-# This section tells your main 'fetch' worker that it can 
-# send messages TO the queue
-[[queues.producers]]
-queue = "RETRY_QUEUE"
-binding = "RETRY_QUEUE" # This makes it available in the code as env.RETRY_QUEUE
+# --- THIS IS THE FIX ---
+# This tells the worker to run the cron job EVERY 5 MINUTES
+[triggers]
+crons = ["*/5 * * * *"] 
 
-# This section tells the queue to trigger this SAME worker 
-# when it receives a message
-[[queues.consumers]]
-queue = "RETRY_QUEUE"
+# This connects your code to the KV database (which is FREE)
+[[kv_namespaces]]
+binding = "RETRY_QUEUE"
+id = "8e81ee4408ca457f8b3ce6e6ae10330c"
